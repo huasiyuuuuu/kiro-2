@@ -50,6 +50,11 @@ from kirogate_addons.pool_strategies import (  # noqa: E402
     make_selector,
 )
 from kirogate_addons.quota_monitor import QuotaMonitor  # noqa: E402
+from kirogate_addons.stall_guard import (  # noqa: E402
+    InflightRegistry,
+    StallGuardConfig,
+    StallReaper,
+)
 
 
 @dataclass
@@ -212,6 +217,28 @@ async def main(real_key: str) -> int:
             print(f"   cache_observer: {snap['total_hits']}/{snap['total_seen']} hits "
                   f"saved {snap['credits_saved']:.4f} credits "
                   f"({snap['savings_pct']:.0f}%)")
+
+            # 8. stall_guard: inflight registry + reaper cancels zombies.
+            reg = InflightRegistry()
+            reaper_cfg = StallGuardConfig.from_env()
+            reaper = StallReaper(reg, interval=0.2)
+            await reaper.start()
+            cancelled = {"v": False}
+
+            def _cancel():
+                cancelled["v"] = True
+
+            async with reg.record(
+                model="m", account="a",
+                deadline_at=time.time() - 0.5, cancel_cb=_cancel,
+            ):
+                await asyncio.sleep(0.4)
+            await reaper.stop()
+            assert cancelled["v"], "reaper didn't cancel the zombie"
+            print(f"   stall_guard: reaper cancelled zombie={cancelled['v']}; "
+                  f"config ttfb={reaper_cfg.ttfb_timeout}s "
+                  f"idle={reaper_cfg.stream_idle_timeout}s "
+                  f"deadline={reaper_cfg.total_deadline}s")
 
 
             await step("stop watcher", watcher.stop())
