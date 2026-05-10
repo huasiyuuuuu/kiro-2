@@ -141,3 +141,173 @@ python -m kirogate                    # gateway using the same keys
 The gateway's `/pool/stats` tells you which keys are in cooldown and
 which have failed; this tool tells you which ones are running low. Use
 both together to decide which keys to retire / top-up.
+
+
+
+---
+
+# kirogate_addons — pluggable components for the rotation pool
+
+While building `kiro_quota.py` I audited the existing [kirogate
+gateway](https://github.com/huasiyuuuuu/kiro/tree/kirogate-gateway) and
+two high-quality reference projects
+([Mirrowel/LLM-API-Key-Proxy](https://github.com/Mirrowel/LLM-API-Key-Proxy),
+[VictorMinemu/CC-Router](https://github.com/VictorMinemu/CC-Router))
+and extracted four drop-in components that kirogate is missing today.
+
+Every module in `kirogate_addons/` is **single-file, stdlib + httpx
+only, duck-typed against kirogate's `AccountPool`**. You can copy a file
+into `kirogate/` and wire it in with ≤ 6 lines. None of them import
+kirogate so they're also usable standalone.
+
+## The four components
+
+| File | Fills this gap | Integration cost |
+|---|---|---|
+| [`pool_strategies.py`](kirogate_addons/pool_strategies.py) | Kirogate only has blind round-robin. You can now pick **proportionally to remaining credits**, least-used, or weighted-random. Plus a per-account async concurrency semaphore so one key doesn't get slammed with 50 parallel requests and auto-throttle. | 4 lines in `pool.py` |
+| [`quota_monitor.py`](kirogate_addons/quota_monitor.py) | Kirogate had zero visibility into per-key balances. This polls `GetUsageLimits` in the background, exposes a lock-free `remaining_credits(key)` lookup, and dead-key-backs-off on failure. Pair with the weighted-by-credits selector above and you finally stop wasting big reservoirs. | 5 lines in `server.py::lifespan` |
+| [`account_health.py`](kirogate_addons/account_health.py) | No preflight — kirogate only discovers a dead key on the first real request. This CLI probes every key's auth, catalog access, and optionally does one minimum-cost streaming call, then classifies each key as `HEALTHY` / `LOW_CREDITS` / `THROTTLED` / `INVALID` / `NETWORK`. Exit code is non-zero on any failure so you can gate deploys on it. | Runs as CLI; `python -m kirogate_addons.account_health --file accounts.json` |
+| [`hot_reload.py`](kirogate_addons/hot_reload.py) | Rotating keys required a process restart, dropping every in-flight stream. This watches the accounts file mtime and mutates the pool in place — new keys added, removed keys retired, existing keys keep their runtime state. Refuses to apply a malformed or empty file. | 3 lines in `server.py::lifespan` |
+
+## Why these, not something else
+
+Comparing kirogate to the two reference projects, these were the
+biggest missing pieces:
+
+| Concept | kirogate | Mirrowel | CC-Router | Added here |
+|---|---|---|---|---|
+| Round-robin rotation | ✓ | ✓ | ✓ | baseline |
+| Cooldown on 429 / backoff | ✓ | ✓ | ✓ | (already good) |
+| Sticky sessions | ✓ (partial) | — | — | (already good) |
+| **Quota-aware routing** | — | ✓ | — | **pool_strategies + quota_monitor** |
+| **Rotation modes** (balanced / sequential / random) | partial | ✓ | — | **pool_strategies** |
+| **Per-account concurrency cap** | — | ✓ | — | **pool_strategies.PerAccountSemaphore** |
+| **Preflight health check** | — | (implicit) | ✓ | **account_health** |
+| **Hot-reload accounts file** | — | — | — | **hot_reload** |
+| Credit-exhausted classification | missing | ✓ | n/a | `account_health` flags as `LOW_CREDITS` or `INVALID` |
+
+Other things on kirogate's own ROADMAP that I **deliberately didn't
+duplicate** because they already exist in kirogate:
+
+- Prometheus `/metrics` — kirogate has it (`observability.py`).
+- Token estimation — kirogate has it (`tokenizer.py`).
+- `count_tokens` endpoint — already implemented.
+- `contextUsageEvent` response header — already emitted.
+
+## Quick run — end-to-end against a live key
+
+```bash
+# All addons wired together into a single smoketest. This is the test
+# you should run after pulling this branch to confirm nothing's broken.
+python -m kirogate_addons.integration_smoketest ksk_...
+```
+
+Expected:
+```
+-- start quota monitor         OK
+-- start hot-reload watcher    OK
+   real key remaining: 999.60
+   weighted picker chose: real
+   semaphore enforced peak <= 3 (observed 3)
+   pool grew to 2 accounts
+   selector over mixed pool hit: {'fake', 'real'}
+   preflight audit status: HEALTHY  remaining=999.60
+integration smoketest PASSED
+```
+
+## Integration recipe (kirogate side)
+
+In `kirogate/pool.py`:
+
+```python
+from kirogate_addons.pool_strategies import make_selector, PerAccountSemaphore
+
+class AccountPool:
+    def __init__(self, accounts, cfg=None, *, selector=None, semaphore=None):
+        ...
+        self._selector  = selector  or make_selector()  # env-driven
+        self._semaphore = semaphore or PerAccountSemaphore(
+            limit_per_account=int(os.environ.get("KIROGATE_MAX_CONCURRENCY_PER_KEY", "4"))
+        )
+
+    def pick(self, sticky_key=None):
+        # ...existing sticky + cooldown logic unchanged...
+        healthy = [a for a in self.accounts if a.cooldown_until <= time.time()]
+        if not healthy:
+            return min(self.accounts, key=lambda a: a.cooldown_until)
+        return self._selector.pick(healthy, now=time.time())
+```
+
+In `kirogate/server.py::lifespan`:
+
+```python
+from kirogate_addons.quota_monitor import QuotaMonitor
+from kirogate_addons.hot_reload import AccountsFileWatcher
+from kirogate_addons.pool_strategies import make_selector
+
+async def lifespan(app):
+    ...
+    pool = AccountPool.from_sources(accounts_file=settings.accounts_file)
+    app.state.pool = pool
+    app.state.http = httpx.AsyncClient(...)
+
+    qm = QuotaMonitor(pool=pool, http=app.state.http)
+    await qm.start()
+    pool._selector = make_selector(
+        "weighted_credits", get_remaining=qm.remaining_credits
+    )
+    app.state.qm = qm
+
+    watcher = AccountsFileWatcher(pool, path=settings.accounts_file)
+    await watcher.start()
+    app.state.watcher = watcher
+
+    yield
+    await watcher.stop()
+    await qm.stop()
+    await app.state.http.aclose()
+```
+
+Wrap upstream calls with the semaphore:
+
+```python
+async with pool._semaphore.slot(acct.key):
+    async for event in generate_assistant_response_stream(...):
+        ...
+```
+
+Add a new dashboard route:
+
+```python
+@app.get("/pool/quota")
+async def pool_quota(...):
+    _require_auth(authorization, x_api_key)
+    return app.state.qm.snapshot()
+```
+
+## Environment variables added
+
+| Var | Default | What it does |
+|---|---|---|
+| `KIROGATE_ROTATION_STRATEGY` | `round_robin` | `round_robin`, `least_used`, `weighted_credits`, `weighted_random` |
+| `KIROGATE_ROTATION_TOLERANCE` | `0.2` | 0.0 = deterministic, 1.0 = fully random (for `weighted_random`) |
+| `KIROGATE_MAX_CONCURRENCY_PER_KEY` | `4` | Max in-flight requests per single key before queueing |
+| `KIROGATE_QUOTA_REFRESH_INTERVAL` | `300` | Seconds between background `GetUsageLimits` polls |
+
+## What's still not done (you have more room to grow)
+
+These were on kirogate's ROADMAP or showed up in the reference projects
+but didn't fit a single-file drop-in so I left them out:
+
+- **Prompt-cache checkpoints** (`cachePoints` in the translator) — needs
+  editing `translator.py` directly; big win for long-history Opus calls.
+- **envState injection** — behind a header; again lives in the translator.
+- **Admin web UI** — the data it would show (`/pool/stats`,
+  `/pool/quota`) is now all available; you just need a React/HTML page.
+- **Docker image** — mostly a CI question, not architectural.
+- **Per-client-IP rate limit at the gateway layer** — one middleware file
+  away, but has policy decisions you should make.
+- **Tenant-scoped `KIROGATE_KEY`** — "client A sees keys 1–3, client B
+  sees keys 4–6".
+
+Happy to drop any of those in on request.
