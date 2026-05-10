@@ -11,6 +11,8 @@ verifies:
      and QuotaMonitor (passed `pool=`) auto-discovers the new keys on
      its next tick.
   5. account_health.audit_one reports HEALTHY for the real key.
+  6. stabilize_payload is idempotent and deterministic.
+  7. CacheObserver records and classifies hits.
 
 Run with:
     python -m kirogate_addons.integration_smoketest ksk_...
@@ -32,6 +34,11 @@ import httpx
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from kirogate_addons.account_health import audit_one, HEALTHY  # noqa: E402
+from kirogate_addons.cache_observer import CacheObserver  # noqa: E402
+from kirogate_addons.cache_stability import (  # noqa: E402
+    payload_prefix_signature,
+    stabilize_payload,
+)
 from kirogate_addons.hot_reload import (  # noqa: E402
     AccountsFileWatcher,
     apply_accounts_to_pool,
@@ -160,6 +167,52 @@ async def main(real_key: str) -> int:
             assert finding.status == HEALTHY, finding
             print(f"   preflight audit status: {finding.status}  "
                   f"remaining={finding.remaining:.2f}")
+
+            # 6. cache_stability is idempotent on payloads with no
+            #    randomness, and its signature-fn is deterministic.
+            fake_payload = {
+                "conversationState": {
+                    "history": [
+                        {"userInputMessage": {
+                            "content": "hi",
+                            "userInputMessageContext": {},
+                            "origin": "KIRO_CLI", "modelId": "claude-haiku-4.5"}},
+                        {"assistantResponseMessage": {
+                            "content": "",
+                            "toolUses": [{
+                                "toolUseId": "call_abcdef0123456789",
+                                "name": "x",
+                                "input": {"v": 1},
+                            }],
+                        }},
+                    ],
+                    "currentMessage": {"userInputMessage": {
+                        "content": "q",
+                        "userInputMessageContext": {},
+                        "origin": "KIRO_CLI", "modelId": "claude-haiku-4.5"}},
+                }
+            }
+            stats = {}
+            stabilize_payload(fake_payload, context_signature="smoke", stats=stats)
+            sig_a = payload_prefix_signature(fake_payload)
+            stabilize_payload(fake_payload, context_signature="smoke")
+            sig_b = payload_prefix_signature(fake_payload)
+            assert sig_a == sig_b, "stabilize is not idempotent"
+            assert stats.get("synthetic_tool_ids_rewritten", 0) == 1, stats
+            print(f"   cache_stability rewrote {stats['synthetic_tool_ids_rewritten']} "
+                  f"random id(s); idempotent signature: {sig_a[:16]}")
+
+            # 7. cache_observer counts warm vs cold.
+            obs = CacheObserver(hit_ratio_threshold=0.65)
+            obs.record(model="claude-haiku-4.5", prefix_signature=sig_a, credits=0.0197)
+            for _ in range(3):
+                obs.record(model="claude-haiku-4.5", prefix_signature=sig_a, credits=0.0105)
+            snap = obs.snapshot()
+            assert snap["total_seen"] == 4 and snap["total_hits"] == 3, snap
+            print(f"   cache_observer: {snap['total_hits']}/{snap['total_seen']} hits "
+                  f"saved {snap['credits_saved']:.4f} credits "
+                  f"({snap['savings_pct']:.0f}%)")
+
 
             await step("stop watcher", watcher.stop())
             await step("stop monitor", qm.stop())

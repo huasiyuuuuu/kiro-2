@@ -160,7 +160,37 @@ only, duck-typed against kirogate's `AccountPool`**. You can copy a file
 into `kirogate/` and wire it in with ≤ 6 lines. None of them import
 kirogate so they're also usable standalone.
 
-## The four components
+## The table above in context: what the experiments showed
+
+Before writing any of the cache components I ran four live probes
+against the real backend (see `experiments/probe_cache*.py`). They
+established:
+
+| Test | Cold call | Warm call | Discount |
+|---|---|---|---|
+| 10k-token prefix, sequential | 0.01970 c | 0.01050 c | **~47%** |
+| Tool-use scenario (client-provided ids) | 0.01550 c | 0.00826 c | **~47%** |
+| Fresh random prefix every call | 0.01970 c | 0.01970 c | 0% |
+| Explicit `cachePoint` / `cache_control` / `cacheCheckpoints` | 0.01050 c | 0.01050 c | **exactly the same as no marker** |
+
+Two conclusions:
+
+1. **Kiro gives you prefix caching for free.** No setup, no special
+   field, no negotiation. Whenever two requests share enough leading
+   tokens, the second one pays ~47% less. This is what Anthropic's
+   implicit prompt cache does behind the scenes at the Bedrock layer.
+2. **Any explicit cache marker in the payload is silently dropped.**
+   We probed every plausible field name (`cachePoint`, `cachePoints`,
+   `cache_control`, `cacheCheckpoints`, `promptCache.enabled`) at every
+   placement level. Every variant costs the same to the 5th decimal.
+   So there's no value in adding explicit markers — and there IS value
+   in not accidentally breaking the implicit one.
+
+`cache_stability.py` and `cache_observer.py` address those two
+findings: keep the history byte-stable, and measure the resulting
+savings.
+
+## The six components
 
 | File | Fills this gap | Integration cost |
 |---|---|---|
@@ -168,6 +198,8 @@ kirogate so they're also usable standalone.
 | [`quota_monitor.py`](kirogate_addons/quota_monitor.py) | Kirogate had zero visibility into per-key balances. This polls `GetUsageLimits` in the background, exposes a lock-free `remaining_credits(key)` lookup, and dead-key-backs-off on failure. Pair with the weighted-by-credits selector above and you finally stop wasting big reservoirs. | 5 lines in `server.py::lifespan` |
 | [`account_health.py`](kirogate_addons/account_health.py) | No preflight — kirogate only discovers a dead key on the first real request. This CLI probes every key's auth, catalog access, and optionally does one minimum-cost streaming call, then classifies each key as `HEALTHY` / `LOW_CREDITS` / `THROTTLED` / `INVALID` / `NETWORK`. Exit code is non-zero on any failure so you can gate deploys on it. | Runs as CLI; `python -m kirogate_addons.account_health --file accounts.json` |
 | [`hot_reload.py`](kirogate_addons/hot_reload.py) | Rotating keys required a process restart, dropping every in-flight stream. This watches the accounts file mtime and mutates the pool in place — new keys added, removed keys retired, existing keys keep their runtime state. Refuses to apply a malformed or empty file. | 3 lines in `server.py::lifespan` |
+| [`cache_stability.py`](kirogate_addons/cache_stability.py) | **Kiro's backend does implicit prefix caching for free (~47% off calls after the first)** — we proved it empirically. But any randomness the translator leaks into `history` destroys byte-stability and breaks the free cache. This module deterministically rewrites known randomness sources (today: `toolUseId` random fallback) so every turn of a conversation pays the warm price. Idempotent; today usually a no-op, tomorrow defense-in-depth. | 1 line in `translator.py` |
+| [`cache_observer.py`](kirogate_addons/cache_observer.py) | Kiro doesn't emit a `cache_read_input_tokens` field, so there's no way today to see whether the free prefix cache is actually hitting in production. This records `(model, prefix_sig, credits)` per call and computes hit rate + real credits saved. Exposes a `/pool/cache` endpoint's worth of data. Bounded LRU, thread-safe. | 3 lines at the streaming response path |
 
 ## Why these, not something else
 
@@ -299,8 +331,8 @@ async def pool_quota(...):
 These were on kirogate's ROADMAP or showed up in the reference projects
 but didn't fit a single-file drop-in so I left them out:
 
-- **Prompt-cache checkpoints** (`cachePoints` in the translator) — needs
-  editing `translator.py` directly; big win for long-history Opus calls.
+| **Prompt-cache checkpoints** (`cachePoints` in the translator) — needs
+  editing `translator.py` directly; big win for long-history Opus calls. | **Done: cache_stability + cache_observer.** After empirical probes against the live backend, the picture was different from what `promptCaching.maximumCacheCheckpointsPerRequest` in model metadata suggests. Kiro does implicit prefix caching automatically (~47% off warm calls); explicit markers are silently dropped. The right fix is protecting byte-stability of history, not adding markers — which is what cache_stability does. |
 - **envState injection** — behind a header; again lives in the translator.
 - **Admin web UI** — the data it would show (`/pool/stats`,
   `/pool/quota`) is now all available; you just need a React/HTML page.

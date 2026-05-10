@@ -5,3 +5,4 @@ __pycache__/
 .env
 accounts.json
 accounts.txt
+experiments/
