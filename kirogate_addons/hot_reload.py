@@ -281,7 +281,12 @@ class AccountsFileWatcher:
         )
         if self._on_reload is not None:
             try:
-                self._on_reload(summary)
+                result = self._on_reload(summary)
+                # Accept either a sync callback or `async def on_reload`.
+                # Previously async callbacks were silently dropped (we
+                # got an un-awaited coroutine and logged a bogus warning).
+                if asyncio.iscoroutine(result):
+                    await result
             except Exception as e:
                 log.warning("on_reload callback raised: %s", e)
 

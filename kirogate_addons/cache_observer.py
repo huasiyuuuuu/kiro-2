@@ -101,7 +101,9 @@ class CacheObserver:
     Parameters
     ----------
     window : int
-        Max entries to retain per (model, sig) key. Older ones drop off.
+        (Deprecated; kept for backward compat.) Previously this capped
+        a per-key rolling buffer, but the buffer was never read — only
+        aggregate counters are used. Pass-through for API stability.
     max_keys : int
         Max distinct (model, sig) pairs tracked before LRU eviction.
     hit_ratio_threshold : float
@@ -117,11 +119,11 @@ class CacheObserver:
         max_keys: int = 2048,
         hit_ratio_threshold: float = 0.65,
     ) -> None:
-        self._window = window
+        self._window = window  # retained for API compat; unused.
         self._max_keys = max_keys
         self._ratio = hit_ratio_threshold
         self._lock = threading.Lock()
-        self._history: Dict[Tuple[str, str], Deque[_Entry]] = {}
+        # Old _history deque removed — it filled memory without being read.
         self._stats: Dict[Tuple[str, str], _PerKeyStats] = {}
         self._key_order: Deque[Tuple[str, str]] = deque()
 
@@ -137,23 +139,15 @@ class CacheObserver:
         now = now or time.time()
         key = (model, prefix_signature)
         with self._lock:
-            buf = self._history.get(key)
             stats = self._stats.get(key)
-            if buf is None:
+            if stats is None:
                 if len(self._key_order) >= self._max_keys:
                     # evict oldest
                     evicted = self._key_order.popleft()
-                    self._history.pop(evicted, None)
                     self._stats.pop(evicted, None)
-                buf = deque(maxlen=self._window)
                 stats = _PerKeyStats()
-                self._history[key] = buf
                 self._stats[key] = stats
                 self._key_order.append(key)
-
-            entry = _Entry(model=model, prefix_signature=prefix_signature,
-                           credits=credits, ts=now)
-            buf.append(entry)
 
             stats.seen += 1
             stats.last_cost = credits
@@ -237,6 +231,52 @@ class CacheObserver:
                 "distinct_signatures": len(self._stats),
             }
 
+    def prometheus(self) -> str:
+        """Render the snapshot as Prometheus text exposition format.
+
+        Plug into kirogate's existing /metrics endpoint, e.g.:
+
+            @app.get("/metrics")
+            async def metrics():
+                return Response(
+                    "\\n".join([
+                        my_other_metrics(),
+                        app.state.cache_observer.prometheus(),
+                    ]),
+                    media_type="text/plain",
+                )
+        """
+        snap = self.snapshot()
+        lines = []
+        lines.append("# HELP kirogate_cache_total_calls Total LLM calls observed.")
+        lines.append("# TYPE kirogate_cache_total_calls counter")
+        lines.append(f"kirogate_cache_total_calls {snap['total_seen']}")
+        lines.append("# HELP kirogate_cache_hits Calls that paid less than max-cost threshold.")
+        lines.append("# TYPE kirogate_cache_hits counter")
+        lines.append(f"kirogate_cache_hits {snap['total_hits']}")
+        lines.append("# HELP kirogate_cache_hit_rate Fraction of calls classified as cache hits.")
+        lines.append("# TYPE kirogate_cache_hit_rate gauge")
+        lines.append(f"kirogate_cache_hit_rate {snap['overall_hit_rate']:.6f}")
+        lines.append("# HELP kirogate_cache_credits_total Total credits actually charged.")
+        lines.append("# TYPE kirogate_cache_credits_total counter")
+        lines.append(f"kirogate_cache_credits_total {snap['total_credits']:.5f}")
+        lines.append("# HELP kirogate_cache_credits_saved Estimated credits saved vs paying max-cost every call.")
+        lines.append("# TYPE kirogate_cache_credits_saved counter")
+        lines.append(f"kirogate_cache_credits_saved {snap['credits_saved']:.5f}")
+
+        lines.append("# HELP kirogate_cache_by_model_hit_rate Hit rate per model.")
+        lines.append("# TYPE kirogate_cache_by_model_hit_rate gauge")
+        for model, m in snap.get("by_model", {}).items():
+            # Sanitize model name for Prom label.
+            mlabel = model.replace('"', '').replace("\\\\", "")
+            lines.append(
+                f'kirogate_cache_by_model_hit_rate{{model="{mlabel}"}} {m["hit_rate"]:.6f}'
+            )
+            lines.append(
+                f'kirogate_cache_by_model_credits_saved{{model="{mlabel}"}} {m["credits_saved"]:.5f}'
+            )
+        return "\n".join(lines) + "\n"
+
 
 # ---------------------------------------------------------------- selftest
 
@@ -262,6 +302,12 @@ def _selftest() -> None:  # pragma: no cover
     obs.record(model="haiku", prefix_signature="other", credits=0.015)
     snap2 = obs.snapshot()
     assert snap2["distinct_signatures"] == 2
+
+    # Prometheus export
+    prom = obs.prometheus()
+    assert "kirogate_cache_total_calls 7" in prom
+    assert "kirogate_cache_hits 5" in prom
+    assert 'kirogate_cache_by_model_hit_rate{model="haiku"}' in prom
 
     print("cache_observer selftest OK")
     import json

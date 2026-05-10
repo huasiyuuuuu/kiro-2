@@ -298,6 +298,60 @@ class InflightRegistry:
         async with self._lock:
             return len(self._entries)
 
+    async def prometheus(self) -> str:
+        """Render inflight state as Prometheus text exposition format.
+
+        The same metric set as kiro_inflight.py --prometheus, but
+        available inside the gateway process itself so you can wire
+        it into the existing /metrics endpoint without polling from
+        outside.
+        """
+        rows = await self.snapshot()
+        total = len(rows)
+        by_phase: Dict[str, int] = {}
+        max_age = 0.0
+        max_idle = 0.0
+        stalled = 0
+        per_acct_bytes: Dict[str, int] = {}
+        per_acct_events: Dict[str, int] = {}
+        for r in rows:
+            phase = r.get("phase", "?")
+            by_phase[phase] = by_phase.get(phase, 0) + 1
+            if phase in ("error", "stalled"):
+                stalled += 1
+            max_age = max(max_age, float(r.get("age_sec") or 0))
+            max_idle = max(max_idle, float(r.get("idle_sec") or 0))
+            acct = str(r.get("account") or "unknown").replace('"', '').replace("\\", "")
+            per_acct_bytes[acct] = per_acct_bytes.get(acct, 0) + int(r.get("bytes") or 0)
+            per_acct_events[acct] = per_acct_events.get(acct, 0) + int(r.get("events") or 0)
+
+        lines = []
+        lines.append("# TYPE kirogate_inflight_total gauge")
+        lines.append(f"kirogate_inflight_total {total}")
+        lines.append("# TYPE kirogate_inflight_by_phase gauge")
+        for phase, n in by_phase.items():
+            lines.append(
+                f'kirogate_inflight_by_phase{{phase="{phase}"}} {n}'
+            )
+        lines.append("# TYPE kirogate_inflight_stalled gauge")
+        lines.append(f"kirogate_inflight_stalled {stalled}")
+        lines.append("# TYPE kirogate_inflight_max_age_seconds gauge")
+        lines.append(f"kirogate_inflight_max_age_seconds {max_age:.3f}")
+        lines.append("# TYPE kirogate_inflight_max_idle_seconds gauge")
+        lines.append(f"kirogate_inflight_max_idle_seconds {max_idle:.3f}")
+        if per_acct_bytes:
+            lines.append("# TYPE kirogate_inflight_bytes_total gauge")
+            for a, b in per_acct_bytes.items():
+                lines.append(
+                    f'kirogate_inflight_bytes_total{{account="{a}"}} {b}'
+                )
+            lines.append("# TYPE kirogate_inflight_events_total gauge")
+            for a, e in per_acct_events.items():
+                lines.append(
+                    f'kirogate_inflight_events_total{{account="{a}"}} {e}'
+                )
+        return "\n".join(lines) + "\n"
+
 
 class StallReaper:
     """Background sweeper that force-cancels zombies that beat the deadline.
@@ -505,7 +559,7 @@ async def guarded_stream(
 
             yield chunk
 
-    except BaseException:
+    except BaseException as exc:
         # Always close the upstream on any exit path (including GeneratorExit
         # from consumer cancellation). This prevents pool leaks.
         with contextlib.suppress(Exception):
@@ -513,9 +567,26 @@ async def guarded_stream(
             close_done = True
         if handle is not None and handle.phase not in ("done",):
             if handle.error is None:
-                handle.error = "raised"
+                # Capture a concrete, inspectable error message on the
+                # handle so /pool/inflight and kiro_inflight.py show the
+                # real reason, not a useless placeholder.
+                if isinstance(exc, StreamStalled):
+                    handle.error = str(exc) or "stalled"
+                elif isinstance(exc, ClientGone):
+                    handle.error = "client_disconnected"
+                elif isinstance(exc, GeneratorExit):
+                    # Consumer walked away mid-iteration. This is the
+                    # normal shutdown path for a FastAPI streaming
+                    # response when the client disconnects; don't
+                    # misclassify as "error".
+                    handle.error = None
+                else:
+                    handle.error = f"{type(exc).__name__}: {str(exc)[:120]}"
             if handle.phase != "stalled":
-                handle.phase = "error"
+                # GeneratorExit just means "consumer done, no error";
+                # leave phase=streaming so it's not flagged as failed.
+                if not isinstance(exc, GeneratorExit):
+                    handle.phase = "error"
         raise
     finally:
         if not close_done:

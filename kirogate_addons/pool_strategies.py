@@ -129,6 +129,14 @@ class WeightedByCreditsSelector:
     so unknown keys still get tried).
 
     If quota info is missing for everyone, falls back to round-robin.
+
+    `skip_below` lets you refuse to pick keys that are almost empty.
+    Those keys are filtered out BEFORE sampling, and if that would
+    leave zero candidates we fall back to considering them (better a
+    low-credit call than a dropped request). Default 1.0 means "skip
+    keys with less than 1 credit remaining" which dodges the pathological
+    case where we pick a key with 0.2 credits and get an instant
+    out-of-credits error.
     """
 
     def __init__(
@@ -138,11 +146,13 @@ class WeightedByCreditsSelector:
         unknown_weight: Optional[float] = None,
         min_weight: float = 0.01,
         softmax_temperature: float = 1.0,
+        skip_below: float = 1.0,
     ) -> None:
         self._get_remaining = get_remaining
         self._unknown_weight = unknown_weight
         self._min_weight = min_weight
         self._temperature = max(softmax_temperature, 0.01)
+        self._skip_below = max(0.0, skip_below)
         self._fallback = RoundRobinSelector()
         self._rng = random.Random()
 
@@ -157,28 +167,46 @@ class WeightedByCreditsSelector:
         if not known:
             return self._fallback.pick(candidates, now=now)
 
+        # Filter out candidates with known-exhausted credits. Unknown
+        # remains in the pool (we give them benefit of the doubt).
+        eligible_indices = [
+            i for i, r in enumerate(remainings)
+            if r is None or r > self._skip_below
+        ]
+        if not eligible_indices:
+            # Everyone is below skip_below. Fall back to the full set
+            # so we still try something — better than a dropped request.
+            eligible_indices = list(range(len(candidates)))
+
+        eligible_cands = [candidates[i] for i in eligible_indices]
+        eligible_rem = [remainings[i] for i in eligible_indices]
+
         # Unknown keys get the mean of known keys unless the caller pinned a value.
         unknown_default = self._unknown_weight
         if unknown_default is None:
-            unknown_default = sum(known) / len(known)
+            known_in_eligible = [r for r in eligible_rem if r is not None]
+            unknown_default = (
+                sum(known_in_eligible) / len(known_in_eligible)
+                if known_in_eligible else 1.0
+            )
 
         raw_weights = [
-            (r if r is not None else unknown_default) for r in remainings
+            (r if r is not None else unknown_default) for r in eligible_rem
         ]
         # Apply softmax-style temperature to flatten/sharpen the distribution.
         # temperature→∞  => uniform; temperature→0 => argmax-like.
         adj = [max(w, self._min_weight) ** (1.0 / self._temperature) for w in raw_weights]
         total = sum(adj)
         if total <= 0:
-            return self._fallback.pick(candidates, now=now)
+            return self._fallback.pick(eligible_cands, now=now)
 
         r = self._rng.random() * total
         cum = 0.0
-        for cand, w in zip(candidates, adj):
+        for cand, w in zip(eligible_cands, adj):
             cum += w
             if r <= cum:
                 return cand
-        return candidates[-1]  # float rounding safety net
+        return eligible_cands[-1]  # float rounding safety net
 
 
 class WeightedRandomSelector:
@@ -253,16 +281,32 @@ class PerAccountSemaphore:
         self._limit = limit_per_account
         self._sems: Dict[str, asyncio.Semaphore] = {}
         self._in_flight: Dict[str, int] = {}
-        self._lock = asyncio.Lock()
+        # Sync lock for guarding dict mutations. asyncio.Lock would be
+        # wrong here because _get() is called outside an await point
+        # from __aenter__, and we need it to be thread/task race-safe
+        # even if two coroutines see a missing key concurrently.
+        self._lock = threading.Lock()
 
     def _get(self, key: str) -> asyncio.Semaphore:
-        # Lock-free fast path; asyncio.Semaphore access is itself task-safe.
+        """Return the asyncio.Semaphore for `key`, creating it race-free.
+
+        Previously this had a TOCTOU bug: two coroutines concurrently
+        calling slot() on a just-added key could each construct their
+        own Semaphore, defeating the per-account limit. We now guard
+        the "get-or-create" with a sync lock; the lock is only held for
+        the microsecond it takes to probe/insert into a dict, never
+        across an await.
+        """
         s = self._sems.get(key)
-        if s is None:
-            s = asyncio.Semaphore(self._limit)
-            self._sems[key] = s
-            self._in_flight[key] = 0
-        return s
+        if s is not None:
+            return s
+        with self._lock:
+            s = self._sems.get(key)
+            if s is None:
+                s = asyncio.Semaphore(self._limit)
+                self._sems[key] = s
+                self._in_flight[key] = 0
+            return s
 
     def slot(self, key: str) -> "_SemSlot":
         return _SemSlot(self, key)
@@ -271,29 +315,54 @@ class PerAccountSemaphore:
         return self._in_flight.get(key, 0)
 
     def stats(self) -> Dict[str, Tuple[int, int]]:
-        return {k: (self._in_flight.get(k, 0), self._limit) for k in self._sems}
+        with self._lock:
+            return {
+                k: (self._in_flight.get(k, 0), self._limit)
+                for k in self._sems
+            }
 
 
 class _SemSlot:
-    """Async context manager for a single slot on a specific key."""
+    """Async context manager for a single slot on a specific key.
+
+    Cancellation-safe: the counter is incremented only after acquire()
+    succeeds, and the decrement runs in a finally block so
+    CancelledError between acquire and the counter bump cannot leak a
+    permit.
+    """
 
     def __init__(self, owner: PerAccountSemaphore, key: str) -> None:
         self._owner = owner
         self._key = key
         self._sem: Optional[asyncio.Semaphore] = None
+        self._counted = False
 
     async def __aenter__(self) -> "_SemSlot":
         self._sem = self._owner._get(self._key)
         await self._sem.acquire()
-        self._owner._in_flight[self._key] = self._owner._in_flight.get(self._key, 0) + 1
+        # Increment the in-flight counter AFTER we successfully
+        # acquired the permit. If acquire is cancelled, we never
+        # bump the counter, and there's nothing to release in
+        # __aexit__ either — asyncio.Semaphore.acquire is
+        # cancellation-safe and will not hold a permit if cancelled.
+        with self._owner._lock:
+            self._owner._in_flight[self._key] = (
+                self._owner._in_flight.get(self._key, 0) + 1
+            )
+            self._counted = True
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
-        self._owner._in_flight[self._key] = max(
-            0, self._owner._in_flight.get(self._key, 0) - 1
-        )
-        if self._sem is not None:
-            self._sem.release()
+        try:
+            if self._counted:
+                with self._owner._lock:
+                    self._owner._in_flight[self._key] = max(
+                        0, self._owner._in_flight.get(self._key, 0) - 1
+                    )
+        finally:
+            # Always release if we actually acquired.
+            if self._sem is not None and self._counted:
+                self._sem.release()
 
 
 # ---------------------------------------------------------------- factory
@@ -374,6 +443,23 @@ def _selftest() -> None:  # pragma: no cover - dev smoke test
     for _ in range(5000):
         tally[wc.pick(accts, now=now).name] += 1
     assert tally["n0"] > tally["n1"] > tally["n2"], tally
+
+    # skip_below: a key with 0.2 credits should never be picked when
+    # another key has plenty.
+    quotas2 = {"k0": 500.0, "k1": 50.0, "k2": 0.2}
+    wc2 = WeightedByCreditsSelector(quotas2.get, skip_below=1.0)
+    tally2 = {"n0": 0, "n1": 0, "n2": 0}
+    for _ in range(2000):
+        tally2[wc2.pick(accts, now=now).name] += 1
+    assert tally2["n2"] == 0, f"exhausted key was picked: {tally2}"
+    assert tally2["n0"] > 0 and tally2["n1"] > 0
+
+    # skip_below: if ALL keys are below threshold, still pick something.
+    quotas3 = {"k0": 0.5, "k1": 0.3, "k2": 0.1}
+    wc3 = WeightedByCreditsSelector(quotas3.get, skip_below=1.0)
+    # Should not raise — fallback kicks in.
+    for _ in range(20):
+        wc3.pick(accts, now=now)
 
     wr = WeightedRandomSelector(tolerance=1.0)  # pure random
     seen = {wr.pick(accts, now=now).name for _ in range(200)}

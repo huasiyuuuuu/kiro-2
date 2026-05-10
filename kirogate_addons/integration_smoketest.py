@@ -55,6 +55,9 @@ from kirogate_addons.stall_guard import (  # noqa: E402
     StallGuardConfig,
     StallReaper,
 )
+from kirogate_addons.account_health_feedback import (  # noqa: E402
+    AccountFailureTracker,
+)
 
 
 @dataclass
@@ -239,6 +242,28 @@ async def main(real_key: str) -> int:
                   f"config ttfb={reaper_cfg.ttfb_timeout}s "
                   f"idle={reaper_cfg.stream_idle_timeout}s "
                   f"deadline={reaper_cfg.total_deadline}s")
+
+            # 9. stall_guard: prometheus export.
+            prom = await reg.prometheus()
+            assert "kirogate_inflight_total" in prom
+            print(f"   stall_guard prometheus OK ({len(prom.splitlines())} metric lines)")
+
+            # 10. account feedback loop: 3 stalls cool down the key.
+            fb = AccountFailureTracker.from_env(pool)
+            # Use a fresh account object to not trample real data.
+            target = pool.accounts[0]
+            base_cd = target.cooldown_until
+            for i in range(2):
+                r = fb.report(target, kind="stall", detail="test stall")
+                assert r is None, f"cooled too early on breach {i+1}"
+            r3 = fb.report(target, kind="stall", detail="test stall")
+            assert r3 is not None and target.cooldown_until > time.time() + 30
+            # Reset so we don't leave the real key cooled down.
+            target.cooldown_until = base_cd
+            target.consecutive_failures = 0
+            fb.report_success(target)
+            fb_stats = fb.stats()
+            print(f"   feedback tracker cooled target after 3 stalls; stats: {fb_stats.get(target.key, {})}")
 
 
             await step("stop watcher", watcher.stop())
